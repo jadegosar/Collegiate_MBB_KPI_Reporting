@@ -1,0 +1,507 @@
+---
+title: "MBB Load Comparison"
+output: html_document
+date: "2023-10-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+#Load libraries
+library(forecast)
+library(xgboost)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(ggrepel) # Load ggrepel
+library(ggdark) # Load ggdark
+library(ggthemes)
+library(chron)
+library(lubridate)
+library(purrr)
+library(caret)
+library(pROC)
+library(Metrics)
+library(gridExtra)
+library(kableExtra)
+library("mice")
+```
+
+
+```{r, include=FALSE}
+# Load in multiple strive files while performing necessary cleaning
+
+# Vector of file names
+strive_file_names2 <- c(
+  "file_1.csv",
+  "file_2.csv",
+  "file_3.csv",
+  "file_4.csv"
+)
+
+# Create an empty list to store the game dataframes
+all_strive <- list()
+
+# Loop through the file names
+for (file_name in strive_file_names2) {
+    strive_data <- read_csv(file_name)
+  
+  # Remove unnecessary column
+  strive_data <- strive_data[-c(39:46)]
+  
+  # Clean column names
+  names(strive_data) <- gsub(" ", "_", names(strive_data))
+  
+  # Remove outlier player if present
+  strive_data <- strive_data %>%
+      filter(`Athlete_Name` != "Player 8")
+  
+  # Split into accelerometer and muscle data
+  accelerometer_data <- strive_data[c(1:10, 24:38)]
+  muscle_data <- strive_data[c(1:9, 11:23)]
+  
+# Append the dataframes to the list
+  all_strive[[file_name]] <- list(accelerometer_data = accelerometer_data, muscle_data = muscle_data)
+}
+```
+
+```{r, include=FALSE}
+# Access the accelerometer data
+accelerometer_data1 <- all_strive[[strive_file_names2[1]]]$accelerometer_data
+accelerometer_data2 <- all_strive[[strive_file_names2[2]]]$accelerometer_data
+accelerometer_data3 <- all_strive[[strive_file_names2[3]]]$accelerometer_data
+accelerometer_data4 <- all_strive[[strive_file_names2[4]]]$accelerometer_data
+
+# Convert the Date_(Local) column to a date type with the correct format
+accelerometer_data1$`Date_(Local)` <- as.Date(accelerometer_data1$`Date_(Local)`, format = "%m/%d/%Y")
+accelerometer_data2$`Date_(Local)` <- as.Date(accelerometer_data2$`Date_(Local)`, format = "%m/%d/%Y")
+accelerometer_data3$`Date_(Local)` <- as.Date(accelerometer_data3$`Date_(Local)`, format = "%m/%d/%Y")
+
+# Combine all strive data into one df
+all_strive_accelerometer_data <- rbind(accelerometer_data1, accelerometer_data2, accelerometer_data3, accelerometer_data4)
+
+# Make Type a factor variable
+all_strive_accelerometer_data$Type <- factor(all_strive_accelerometer_data$Type)
+
+# Filter for practices
+strive_accelerometer_practices <- all_strive_accelerometer_data %>%
+    filter(Type == "practice")
+
+# View output
+View(strive_accelerometer_practices)
+```
+
+```{r, include=FALSE}
+# Select columns of interest
+strive_imp_cols <- strive_accelerometer_practices[1:10]
+
+# Convert time in seconds to total time in minutes and calculate external load per minute
+strive_load <- strive_imp_cols %>%
+    mutate(Total_Time_Mins = round(`Total_Time_(seconds)`/60),
+           Ext_Load_Per_Min = External_Load/Total_Time_Mins)
+
+# Create a column to determine part of season based on date
+strive_load_season <- strive_load %>%
+  mutate(Season = case_when(
+    `Date_(Local)` <= as.Date("2023-03-06") ~ "22 Season",
+    `Date_(Local)` > as.Date("2023-03-06") & `Date_(Local)` <= as.Date("2023-07-24") ~ "Summer 2023",
+    `Date_(Local)` > as.Date("2023-07-24") ~ "Season 23"
+  ))
+
+# Turn season indicator into factor variable
+strive_load_season$Season <- as.factor(strive_load_season$Season)
+```
+
+```{r, echo=FALSE}
+# Define players to be included in previous season analysis
+last_season_inclusions <- c("Player 1", "Player 3", "Player 5", "Player 6")
+
+# Define players returning for upcoming season
+returners <- c("Player 11", "Player 2", "Player 12", "Player 9",  "Player 10", "Player 14", "Player 15")
+
+# Define players from upcoming season to include in summer and preseason calculations
+season_inclusions <- c("Player 4", "Player 7", "Player 13", "Player 16", ""Player 17", ""Player 18")
+
+# Print the lists using cat
+cat("Last Season Inclusions, included in 'Team' averages for last season:\n")
+cat(last_season_inclusions, sep = "\n")
+cat("Returners group:\n")
+cat(returners, sep = "\n")
+cat("This season Inclusions, included in 'Team' averages for this summer and this season:\n")
+cat(season_inclusions, sep = "\n")
+```
+
+## Returners vs. Returners + Included players from last season
+```{r, include=FALSE}
+# Filter season, external load, and athlete names parameters to full '22 team
+session_22_szn <- strive_load_season %>%
+    filter(Season == "22 Season",
+           External_Load > 0,
+           Athlete_Name %in% last_season_inclusions | Athlete_Name %in% returners)
+
+# Look at summary stastics of external load and external load per minute
+summary(session_22_szn$External_Load)
+summary(session_22_szn$Ext_Load_Per_Min)
+
+# Filter season, external load, and athlete names parameters to returning team from '22
+session_22_szn_returners <- strive_load_season %>%
+    filter(Season == "22 Season",
+           External_Load > 0,
+           Athlete_Name %in% returners)
+
+# Look at summary stastics of external load and external load per minute for returners from last season
+summary(session_22_szn_returners$External_Load)
+summary(session_22_szn_returners$Ext_Load_Per_Min)
+```
+
+```{r, include=FALSE}
+# Calculate averages across '22 team for metrics of interest
+last_szn_summary <- session_22_szn %>%
+    group_by(Type) %>%
+    summarize(Avg_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Specify calculation is for entire '22 team
+overall_22_szn <- last_szn_summary %>%
+    mutate(Type = "Team values")
+
+# Calculate averages of metrics for only players who are returning
+last_season_returners <- session_22_szn_returners %>%
+    group_by(Type) %>%
+    summarize(Avg_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Specify calculation is for returners
+returners_last_season <- last_season_returners %>%
+    mutate(Type = "Returners values")
+```
+
+```{r, echo=FALSE}
+# Display comparison table of metric averages across sessions from last season for '22 team vs returners
+last_szn_differences <- rbind(overall_22_szn, returners_last_season)
+
+# Format for printing table in html output
+kable(last_szn_differences, format = "html")  %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r, include=FALSE}
+# Create df to calculate team averages by session
+season_22_all <- session_22_szn %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Team_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Create df to calculate returner averages by session
+season_22_select <- session_22_szn_returners %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Returner_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Returner_Load = mean(External_Load),
+              Avg_Returner_Load_Per_Min = mean(Ext_Load_Per_Min))
+```
+
+```{r, include=FALSE}
+# Join the two dataframes based on activity date
+season_practices_load <- inner_join(season_22_all, season_22_select, by = "Date_(Local)")
+
+# Calculate the difference in load and load per minute for two groups
+szn_avg_load <- season_practices_load %>%
+  mutate(Team_Load_Difference = Avg_Returner_Load - Avg_Team_Load,
+         Player_Load_Difference = Avg_Returner_Load_Per_Min - Avg_Player_Load_Per_Min)
+
+# Arrange df by session with highest difference in load between team and just returners
+szn_avg_load <- szn_avg_load %>%
+  arrange(desc(Team_Load_Difference))
+
+# Reformat column order and display df
+szn_avg_load[c("Date_(Local)", "Team_Load_Difference", "Player_Load_Difference", "Team_Duration_Mins", "Returner_Duration_Mins", "Avg_Team_Load", "Avg_Returner_Load", "Avg_Player_Load_Per_Min", "Avg_Returner_Load_Per_Min")]
+```
+
+
+```{r, echo = FALSE}
+# Calculate average differences for output
+avg_difference <- mean(szn_avg_load$Team_Load_Difference)
+avg_load <- mean(szn_avg_load$Avg_Team_Load)
+avg_per_min_difference <- mean(szn_avg_load$Player_Load_Difference)
+avg_load_per_min <- mean(szn_avg_load$Avg_Player_Load_Per_Min)
+
+# Calculate magnitude of differences
+load_perc_diff <- abs(round((avg_difference/avg_load) * 100, 2))
+load_per_min_perc_diff <- abs(round((avg_per_min_difference/avg_load_per_min) * 100, 2))
+
+# Print the result
+cat("Average difference in load of the team between just the returners and the entire team of interest for last season per session was:", avg_difference, "with an average difference in load per minute of:", avg_per_min_difference, ". This means that the total load for returners, on average, was", load_perc_diff, "% lower than all players of interest and returners combined for last season. This is accompanied by an average decrease of", load_per_min_perc_diff, "% in load per minute with duration remaining constant.")
+```
+
+## Returners vs. Returners + Included players from this season for summer
+```{r, include=FALSE}
+# Filter season, external load, and athlete names parameters to full '23 team for summer sessions
+session_23_summer <- strive_load_season %>%
+    filter(Season == "Summer 2023",
+           External_Load > 0,
+           Athlete_Name %in% season_inclusions | Athlete_Name %in% returners)
+
+# Look at summary stastics of external load and external load per minute for summer sessions
+summary(session_23_summer$External_Load)
+summary(session_23_summer$Ext_Load_Per_Min)
+
+# Filter season, external load, and athlete names parameters to returners for summer sessions
+session_23_summer_returners <- strive_load_season %>%
+    filter(Season == "Summer 2023",
+           External_Load > 0,
+           Athlete_Name %in% returners)
+
+# Look at summary stastics of external load and external load per minute of returners for summer sessions
+summary(session_23_summer_returners$External_Load)
+summary(session_23_summer_returners$Ext_Load_Per_Min)
+```
+
+```{r, include=FALSE}
+# Calculate averages of '23 team in summer sessions for metrics of interest
+summer_summary <- session_23_summer %>%
+    group_by(Type) %>%
+    summarize(Avg_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Specify calculation is for entire '23 team
+overall_summer <- summer_summary %>%
+    mutate(Type = "Team values")
+
+# Calculate averages of returners in summer sessions for metrics of interest
+summer_returners <- session_23_summer_returners %>%
+    group_by(Type) %>%
+    summarize(Avg_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Specify calculation is for returners
+returners_summer <- summer_returners %>%
+    mutate(Type = "Returners values")
+```
+
+```{r, echo=FALSE}
+# Display comparison table of metric averages across sessions from the summer for '23 team vs returners
+summer_differences <- rbind(overall_summer, returners_summer)
+
+# Format for printing table in html output
+kable(summer_differences, format = "html")  %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r, include=FALSE}
+# Create df to calculate team averages by summer session
+summer_23_all <- session_23_summer %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Team_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Create df to calculate returner averages by summer session
+summer_23_select <- session_23_summer_returners %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Returner_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Returner_Load = mean(External_Load),
+              Avg_Returner_Load_Per_Min = mean(Ext_Load_Per_Min))
+```
+
+```{r, include=FALSE}
+# Join the two dataframes based on activity date
+summer_practices_load <- inner_join(summer_23_all, summer_23_select, by = "Date_(Local)")
+
+# Calculate the difference in load and load per minute in summer sessions for two groups
+summer_avg_load <- summer_practices_load %>%
+  mutate(Team_Load_Difference = Avg_Returner_Load - Avg_Team_Load,
+         Player_Load_Difference = Avg_Returner_Load_Per_Min - Avg_Player_Load_Per_Min)
+
+# Arrange df by session with highest difference in load between team and just returners
+summer_avg_load <- summer_avg_load %>%
+  arrange(desc(Team_Load_Difference))
+
+# Reformat column order and display df
+summer_avg_load[c("Date_(Local)", "Team_Load_Difference", "Player_Load_Difference", "Team_Duration_Mins", "Returner_Duration_Mins", "Avg_Team_Load", "Avg_Returner_Load", "Avg_Player_Load_Per_Min", "Avg_Returner_Load_Per_Min")]
+```
+
+```{r, echo=FALSE}
+# Calculate average differences in summer sessions for two groups
+avg_summer_difference <- mean(summer_avg_load$Team_Load_Difference)
+avg_summer_load <- mean(summer_avg_load$Avg_Team_Load)
+avg_summer_per_min_difference <- mean(summer_avg_load$Player_Load_Difference)
+avg_summer_load_per_min <- mean(summer_avg_load$Avg_Player_Load_Per_Min)
+
+# Calculate magnitude of differences
+summer_load_perc_diff <- abs(round((avg_summer_difference/avg_summer_load) * 100, 2))
+summer_load_per_min_perc_diff <- abs(round((avg_summer_per_min_difference/avg_summer_load_per_min) * 100, 2))
+
+# Print the result
+cat("Average difference in load of the team between just the returners and the entire team of interest for this summer per session was:", avg_summer_difference, "with an average difference in load per minute of:", avg_summer_per_min_difference, ". This means that the total load for returners, on average, was", summer_load_perc_diff, "% higher than all players of interest and returners combined for this summer. This is accompanied by an average increase of", summer_load_per_min_perc_diff, "% in load per minute with duration remaining constant.")
+```
+
+## Returners vs. Returners + Included players from this season for sessions this fall
+```{r, include=FALSE}
+# Filter season, external load, and athlete names parameters to full '23 team for fall sessions
+session_23_szn <- strive_load_season %>%
+    filter(Season == "Season 23",
+           External_Load > 25,
+           Athlete_Name %in% season_inclusions | Athlete_Name %in% returners)
+
+# Look at summary stastics of external load and external load per minute for fall sessions
+summary(session_23_szn$External_Load)
+summary(session_23_szn$Ext_Load_Per_Min)
+
+# Filter season, external load, and athlete names parameters to returners for fall sessions
+session_23_szn_returners <- strive_load_season %>%
+    filter(Season == "Season 23",
+           External_Load > 25,
+           Athlete_Name %in% returners)
+
+# Look at summary stastics of external load and external load per minute of returners for fall sessions
+summary(session_23_szn_returners$External_Load)
+summary(session_23_szn_returners$Ext_Load_Per_Min)
+```
+
+```{r, include=FALSE}
+# Calculate averages of '23 team in fall sessions for metrics of interest
+season_summary <- session_23_szn %>%
+    group_by(Type) %>%
+    summarize(Avg_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Specify calculation is for entire '23 team
+overall_season <- season_summary %>%
+    mutate(Type = "Team values")
+
+# Calculate averages of returners in fall sessions for metrics of interest
+season_returners <- session_23_szn_returners %>%
+    group_by(Type) %>%
+    summarize(Avg_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Specify calculation is for returners
+returners_season <- season_returners %>%
+    mutate(Type = "Returners values")
+```
+
+```{r, echo=FALSE}
+# Display comparison table of metric averages across sessions from the fall for '23 team vs returners
+season_differences <- rbind(overall_season, returners_season)
+
+# Format for printing table in html output
+kable(season_differences, format = "html")  %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r, include=FALSE}
+# Create df to calculate team averages by fall session
+current_szn_23_all <- session_23_szn %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Team_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Create df to calculate returner averages by fall session
+current_szn_23_select <- session_23_szn_returners %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Returner_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Returner_Load = mean(External_Load),
+              Avg_Returner_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Join the two dataframes based on activity date
+current_szn_practices_load <- inner_join(current_szn_23_all, current_szn_23_select, by = "Date_(Local)")
+
+# Calculate the difference in load and load per minute in fall sessions for two groups
+current_szn_avg_load <- current_szn_practices_load %>%
+  mutate(Team_Load_Difference = Avg_Returner_Load - Avg_Team_Load,
+         Player_Load_Difference = Avg_Returner_Load_Per_Min - Avg_Player_Load_Per_Min)
+
+# Arrange df by session with highest difference in load between team and just returners
+current_szn_avg_load <- current_szn_avg_load %>%
+  arrange(desc(Team_Load_Difference))
+
+# Reformat column order and display df
+current_szn_avg_load[c("Date_(Local)", "Team_Load_Difference", "Player_Load_Difference", "Team_Duration_Mins", "Returner_Duration_Mins", "Avg_Team_Load", "Avg_Returner_Load", "Avg_Player_Load_Per_Min", "Avg_Returner_Load_Per_Min")]
+```
+
+```{r, echo=FALSE}
+# Calculate average differences in fall sessions for two groups
+current_szn_avg_difference <- mean(current_szn_avg_load$Team_Load_Difference)
+current_szn_load <- mean(current_szn_avg_load$Avg_Team_Load)
+current_szn_avg_per_min_difference <- mean(current_szn_avg_load$Player_Load_Difference)
+current_szn_avg_load_per_min <- mean(current_szn_avg_load$Avg_Player_Load_Per_Min)
+
+# Calculate magnitude of differences
+current_szn_load_perc_diff <- abs(round((current_szn_avg_difference/current_szn_load) * 100, 1))
+current_szn_load_per_min_perc_diff <- abs(round((current_szn_avg_per_min_difference/current_szn_avg_load_per_min) * 100, 1))
+
+# Print the result
+cat("Average difference in load of the team between just the returners and the entire team of interest for this season per session is:", current_szn_avg_difference, "with an average difference in load per minute of:", current_szn_avg_per_min_difference, ". This means that the total load for returners, on average, is", current_szn_load_perc_diff, "% higher than all players of interest and returners combined for this fall season. This is accompanied by an average increase of", current_szn_load_per_min_perc_diff, "% in load per minute with duration remaining constant.")
+```
+
+## Returners vs. Returners + Included players from this season for all sessions so far (summer + fall 2023)
+```{r, include=FALSE}
+# Filter season, external load, and athlete names parameters to full '23 team for all sessions in '23
+all_season <- strive_load_season %>%
+    filter(Season == "Season 23" | Season == "Summer 2023",
+           External_Load > 25,
+           Athlete_Name %in% season_inclusions | Athlete_Name %in% returners)
+
+# Filter season, external load, and athlete names parameters to returners for all sessions in '23
+all_season_returners <- strive_load_season %>%
+    filter(Season == "Season 23" | Season == "Summer 2023",
+           External_Load > 25,
+           Athlete_Name %in% returners)
+
+# Calculate averages of '23 team for each session in season for metrics of interest
+season_23_all <- all_season %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Team_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Team_Load = mean(External_Load),
+              Avg_Player_Load_Per_Min = mean(Ext_Load_Per_Min))
+
+# Calculate averages of returners for each session in season for metrics of interest
+season_23_all_select <- all_season_returners %>%
+    group_by(`Date_(Local)`) %>%
+    summarize(Returner_Duration_Mins = mean(Total_Time_Mins),
+              Avg_Returner_Load = mean(External_Load),
+              Avg_Returner_Load_Per_Min = mean(Ext_Load_Per_Min))
+```
+
+```{r, include=FALSE}
+# Join the two dataframes based on activity date
+all_23_practices_load <- inner_join(season_23_all, season_23_all_select, by = "Date_(Local)")
+
+# Calculate the difference in load and load per minute in all sessions for two groups
+all_23_szn_avg_load <- all_23_practices_load %>%
+  mutate(Team_Load_Difference = Avg_Returner_Load - Avg_Team_Load,
+         Player_Load_Difference = Avg_Returner_Load_Per_Min - Avg_Player_Load_Per_Min)
+
+# Arrange df by session with highest difference in load between team and just returners
+all_23_szn_avg_load <- all_23_szn_avg_load %>%
+  arrange(desc(Team_Load_Difference))
+
+# Reformat column order and display df
+all_23_szn_avg_load[c("Date_(Local)", "Team_Load_Difference", "Player_Load_Difference", "Team_Duration_Mins", "Returner_Duration_Mins", "Avg_Team_Load", "Avg_Returner_Load", "Avg_Player_Load_Per_Min", "Avg_Returner_Load_Per_Min")]
+```
+
+```{r, echo=FALSE}
+# Calculate average differences in fall sessions for two groups
+szn_23_avg_difference <- mean(all_23_szn_avg_load$Team_Load_Difference)
+szn_23_load <- mean(all_23_szn_avg_load$Avg_Team_Load)
+szn_23_avg_per_min_difference <- mean(all_23_szn_avg_load$Player_Load_Difference)
+szn_23_avg_load_per_min <- mean(all_23_szn_avg_load$Avg_Player_Load_Per_Min)
+
+# Calculate magnitude of differences
+szn_23_load_perc_diff <- abs(round((szn_23_avg_difference/szn_23_load) * 100, 2))
+szn_23_load_per_min_perc_diff <- abs(round((szn_23_avg_per_min_difference/szn_23_avg_load_per_min) * 100, 2))
+
+# Print the result
+cat("Average difference in load of the team between just the returners and the entire team of interest per session for all sessions this season is:", szn_23_avg_difference, "with an average difference in load per minute of:", szn_23_avg_per_min_difference, ". This means that the total load for returners, on average, is", szn_23_load_perc_diff, "% higher than all players of interest and returners combined so far this season (summer + fall). This is accompanied by an average increase of", szn_23_load_per_min_perc_diff, "% in load per minute with duration remaining constant.")
+```
