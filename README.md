@@ -33,8 +33,8 @@ The data sources used for this project were:
 
 **Exploratory Data Analysis**
 
-<center><img src="MBB_Peak_Power_BP.png"/></center>
-<center><img src="MBB_PlusMinus_Score.png"/></center>
+<center><img src="images/MBB_Peak_Power_BP.png"/></center>
+<center><img src="images/MBB_PlusMinus_Score.png"/></center>
 
 **Force Plate Trial Analysis**
 
@@ -62,7 +62,7 @@ The metrics that had statistically signficant differences between tests before a
 
 The picture below shows the dashboard page that I created in PowerBI as a potential supplement to the dashboard my group created. The main goal I had was to see if there was a way we could effectively integrate our Strive data source to represent both the most important metrics we found from our force plate analysis and accelerometer and load measures collected via Strive.
 
-<center><img src="MBB_Dashboard.png"/></center>
+<center><img src="images/MBB_Dashboard.png"/></center>
 
 My group member Ethan created the final dashboard in PowerBI that would be used by the Strength and Conditioning staff to inform their decision-making on whether an athlete may be fatigued or if there is any intervention needed based on how the athlete is testing across the important metrics collected via Force Plates. His awesome work is picured below!
 
