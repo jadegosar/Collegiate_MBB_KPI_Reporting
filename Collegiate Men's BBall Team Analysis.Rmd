@@ -1,0 +1,938 @@
+---
+title: "Collegiate Mens Basketball Team Analysis"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Package installation and loading
+
+```{r}
+# Install necessary packages
+#install.packages(c("forecast", "xgboost", "tidyverse", "readxl", "ggplot2", "dplyr", "ggrepel", #"ggdark", "ggthemes", "chron", "lubridate", "purrr", "caret", "pROC", "Metrics", "gridExtra", "mice", "scales))
+
+#Load libraries
+library(forecast)
+library(xgboost)
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(ggrepel) # Load ggrepel
+library(ggdark) # Load ggdark
+library(ggthemes)
+library(chron)
+library(lubridate)
+library(purrr)
+library(caret)
+library(pROC)
+library(Metrics)
+library(gridExtra)
+library("mice")
+library(scales)
+```
+
+# Data aggregation and cleaning
+
+## Load and clean necessary data sources
+
+Load in performance data from Force Plate countermovement jumps, team's schedule information, Strive practice and game data, and file that contains in-game metrics and +/- scores created by Sport Scientist on MBB staff. Perform various cleaning tasks on each of the files, mainly removing columns with all NA values, formatting variables, and removing players that were deemed by staff as "outliers".
+
+```{r import and clean Force Plate data}
+# Load in Force Plate CMJ data
+MBB_CMJ_All_Trials <- read_excel("MBB CMJ All Trials.xlsx")
+
+all_force_plate <- MBB_CMJ_All_Trials
+
+# Find which columns in force plate data have NA values
+na_counts <- colSums(is.na(all_force_plate))
+
+#Remove columns with NA values
+all_force_plate_no_zeros <- all_force_plate[-c(2, 6, 16, 95:96, 115, 121, 128, 145, 150:151, 162:163, 176:177, 210:211)]
+
+#Check to make sure all columns have zero NA values or very few (will be using complete rows in analysis which would keep the column while only removing the few rows with the NA's )
+na_counts2 <- colSums(is.na(all_force_plate_no_zeros))
+
+# Fix the names of the columns by removing spaces and special characters
+names(all_force_plate_no_zeros) <- gsub(" ", "_", names(all_force_plate_no_zeros))
+names(all_force_plate_no_zeros) <- gsub("\\[|\\]", ".", names(all_force_plate_no_zeros))
+names(all_force_plate_no_zeros) <- gsub("\\(|\\)", ".", names(all_force_plate_no_zeros))
+names(all_force_plate_no_zeros) <- gsub(":", "-", names(all_force_plate_no_zeros))
+
+# Import excel with de-identified player ids
+MBB_Player_Name_Map <- read_excel("MBB_Player_Name_Map.xlsx")
+
+# Replace player names with IDs
+fp_mbb_w_ids <- all_force_plate_no_zeros %>%
+  left_join(MBB_Player_Name_Map, by = c("Athlete" = "Player Name"))
+
+# Remove identifiable player name column and reorder columns
+fp_mbb_w_ids <- fp_mbb_w_ids %>%
+    select(-Athlete) %>%
+    select("Player ID", everything())
+
+# Remove outlier player
+fp_mbb_w_ids <- fp_mbb_w_ids %>%
+    filter(`Player ID` != "Player 8")
+
+# Format Trial and Test variables
+fp_mbb_w_ids$Trial <- factor(fp_mbb_w_ids$Trial)
+fp_mbb_w_ids$Test_Date <- format(fp_mbb_w_ids$Test_Date, "%Y/%m/%d")
+```
+
+```{r import and clean schedule info}
+# Load in MBB Schedule info
+MBB_game_info_22_23 <- read_excel("Men's BBall Schedule info.xlsx", 
+    sheet = "22-23")
+MBB_game_info_21_22 <- read_excel("Men's BBall Schedule info.xlsx", 
+    sheet = "21-22")
+
+# Combine 21-22 and 22-23 seasons into one df
+MBB_game_info <- rbind(MBB_game_info_21_22, MBB_game_info_22_23)
+
+# Rename column and turn categorical variables into factors
+clean_MBB_game_info <- rename(MBB_game_info, Date_Of_Game = Date)
+clean_MBB_game_info$`Home/Away` <- factor(clean_MBB_game_info$`Home/Away`)
+clean_MBB_game_info$`Win/Loss` <- factor(clean_MBB_game_info$`Win/Loss`)
+```
+
+```{r import strive data}
+# Load in multiple strive files while performing necessary cleaning
+
+# Vector of file names
+strive_file_names <- c(
+  "strive_sessions_426_420_and_327_summaries.csv",
+  "strive_sessions_481_480_474_472_470_468_467_464_460_459_455_451_448_446_444_443_441_440_436_435_433_431_and_430_summaries.csv",
+  "strive_sessions_537_535_534_532_530_528_526_524_523_519_517_515_513_509_508_507_506_504_502_500_498_496_495_494_492_489_487_484_and_482_summaries.csv"
+)
+
+# Create an empty list to store the game dataframes
+strive_list <- list()
+
+# Loop through the file names
+for (file_name in strive_file_names) {
+    strive_data <- read_csv(file_name)
+  
+  # Remove unnecessary column
+  strive_data <- strive_data[-c(39:46)]
+  
+  # Clean column names
+  names(strive_data) <- gsub(" ", "_", names(strive_data))
+  
+  # Split into accelerometer and muscle data
+  accelerometer_data <- strive_data[c(1:10, 24:38)]
+  muscle_data <- strive_data[c(1:9, 11:23)]
+  
+  # Merge with MBB_Player_Name_Map
+  accelerometer_data <- left_join(accelerometer_data, MBB_Player_Name_Map, by = c("Athlete_Name" = "Player Name"))
+  muscle_data <- left_join(muscle_data, MBB_Player_Name_Map, by = c("Athlete_Name" = "Player Name"))
+  
+# Append the dataframes to the list
+  strive_list[[file_name]] <- list(accelerometer_data = accelerometer_data, muscle_data = muscle_data)
+}
+```
+
+```{r clean strive data}
+# Access the accelerometer data
+accelerometer_data1 <- strive_list[[strive_file_names[1]]]$accelerometer_data
+accelerometer_data2 <- strive_list[[strive_file_names[2]]]$accelerometer_data
+accelerometer_data3 <- strive_list[[strive_file_names[3]]]$accelerometer_data
+
+# Convert the Date_(Local) column to a date type with the correct format
+accelerometer_data1$`Date_(Local)` <- as.Date(accelerometer_data1$`Date_(Local)`, format = "%m/%d/%Y")
+accelerometer_data2$`Date_(Local)` <- as.Date(accelerometer_data2$`Date_(Local)`, format = "%m/%d/%Y")
+accelerometer_data3$`Date_(Local)` <- as.Date(accelerometer_data3$`Date_(Local)`, format = "%m/%d/%Y")
+
+# Access the muscle data
+muscle_data1 <- strive_list[[strive_file_names[1]]]$muscle_data
+muscle_data2 <- strive_list[[strive_file_names[2]]]$muscle_data
+muscle_data3 <- strive_list[[strive_file_names[3]]]$muscle_data
+
+# Convert the Date_(Local) column to a date type with the correct format
+muscle_data1$`Date_(Local)` <- as.Date(muscle_data1$`Date_(Local)`, format = "%m/%d/%Y")
+muscle_data2$`Date_(Local)` <- as.Date(muscle_data2$`Date_(Local)`, format = "%m/%d/%Y")
+muscle_data3$`Date_(Local)` <- as.Date(muscle_data3$`Date_(Local)`, format = "%m/%d/%Y")
+
+# Combine accelerometer dataframes and muscle load data together from strive files
+strive_season_accelerometer_data <- rbind(accelerometer_data1, accelerometer_data2, accelerometer_data3)
+strive_season_muscle_data <- rbind(muscle_data1, muscle_data2, muscle_data3)
+
+# Convert Type variable to factor
+strive_season_accelerometer_data$Type <- as.factor(strive_season_accelerometer_data$Type)
+strive_season_muscle_data$Type <- as.factor(strive_season_muscle_data$Type)
+
+# Remove outlier athlete and fix player ids that were not mapped correctly
+strive_season_accelerometer_data <- strive_season_accelerometer_data %>%
+    filter(!(Athlete_ID %in% c(1566, 1280))) %>%
+    mutate(`Player ID` = case_when(
+        Athlete_ID == 1279 ~ "Player 5",
+        TRUE ~ `Player ID` # Keep the original Player ID if no condition matches
+    ))
+strive_season_muscle_data <- strive_season_muscle_data %>%
+    filter(!(Athlete_ID %in% c(1566, 1280))) %>%
+    mutate(`Player ID` = case_when(
+        Athlete_ID == 1279 ~ "Player 5",
+        TRUE ~ `Player ID` # Keep the original Player ID if no condition matches
+    ))
+
+# Write dataframes to a CSV files
+#write.csv(strive_season_muscle_data, "strive_muscle_load_data.csv", row.names = FALSE)
+#write.csv(strive_season_accelerometer_data, "strive_accelerometer_data.csv", row.names = FALSE)
+```
+
+```{r import minutes played file}
+min_played <- read_excel("Men's Basketball - MIN Played Export (1).xlsx", 
+    sheet = "Min Played")
+
+# Define new column names for pivoted minutes played file
+new_column_names <- c("Athlete", "11/3/2022", "11/7/2022", "11/11/2022", "11/14/2022", "11/17/2022", "11/21/2022", "11/23/2022", "11/26/2022", "12/1/2022", "12/4/2022", "12/8/2022", "12/13/2022", "12/17/2022", "12/21/2022", "12/29/2022", "12/31/2022", "1/5/2023", "1/7/2023", "1/12/2023", "1/14/2023", "1/19/2023", "1/21/2023", "1/26/2023", "1/28/2023", "2/2/2023", "2/5/2023", "2/11/2023", "2/16/2023", "2/18/2023", "2/23/2023", "2/25/2023", "3/4/2023", "3/8/2023")
+
+# Replace column names from excel import
+colnames(min_played) <- new_column_names
+
+# Reshape min_played to long format
+min_played_long <- min_played %>%
+  pivot_longer(cols = matches("11/3/2022|11/7/2022|11/11/2022|11/14/2022|11/17/2022|11/21/2022|11/23/2022|11/26/2022|12/1/2022|12/4/2022|12/8/2022|12/13/2022|12/17/2022|12/21/2022|12/29/2022|12/31/2022|1/5/2023|1/7/2023|1/12/2023|1/14/2023|1/19/2023|1/21/2023|1/26/2023|1/28/2023|2/2/2023|2/5/2023|2/11/2023|2/16/2023|2/18/2023|2/23/2023|2/25/2023|3/4/2023|3/8/2023"), names_to = "Date", values_to = "Value")
+
+# Convert Date column to Date type
+min_played_long$Date <- as.Date(min_played_long$Date, format = "%m/%d/%Y")
+
+# Format minutes played file by switching the order of names within the Athlete column to be "First Name Last Name"
+min_played_long_clean <- min_played_long %>%
+  separate(Athlete, into = c("Last_Name", "First_Name"), sep = ", ", remove = FALSE) %>%
+  mutate(Athlete = paste(First_Name, Last_Name, sep = " ")) %>%
+  select(-First_Name, -Last_Name)
+
+# Change column names for merging minutes played with force plate and game info
+colnames(min_played_long_clean)[colnames(min_played_long_clean) == "Date"] <- "Date_Of_Game"
+colnames(min_played_long_clean)[colnames(min_played_long_clean) == "Value"] <- "Minutes_Played"
+
+# Update names for athletes with inconsistent name across data sources and remove outliers
+min_played_long_clean$Athlete <- ifelse(min_played_long_clean$Athlete == "Wilguens Junior Exacte",
+                                            "Wil Exacte",
+                                            ifelse(min_played_long_clean$Athlete == "Mike Saunders ",
+                                                   "Mike Saunders", min_played_long_clean$Athlete))
+
+# Merge df with player name map to de-identify outputs
+min_played_long_formatted <- left_join(min_played_long_clean, MBB_Player_Name_Map, by = c("Athlete" = "Player Name")) %>%
+    filter(!is.na(`Player ID`))
+
+# Create excel file from cleaned minutes played file
+#write.csv(min_played_long_formatted, "minutes_played_updated.csv", row.names = FALSE)
+```
+
+```{r import in-game metrics and player statistics}
+# Load in game metrics and player + team ratings from +/-
+JJ_Ratings <- read_excel("Ratings.xlsx", sheet = "Sheet1")
+
+# Update column name
+colnames(JJ_Ratings)[colnames(JJ_Ratings) == "Overall_Rating"] <- "Player_Rating"
+
+# Update names for athletes with inconsistent name across data sources
+JJ_Ratings$Athlete <- ifelse(JJ_Ratings$Athlete == "Wilguens Exacte",
+                                            "Wil Exacte",
+                                            ifelse(JJ_Ratings$Athlete == "Mike Saunders Jr.",
+                                                   "Mike Saunders", JJ_Ratings$Athlete))
+
+# Create copy of data source to keep a copy of the original
+game_metrics_copy <- JJ_Ratings
+
+# Merge df with player name map to de-identify outputs
+JJ_for_viz <- left_join(game_metrics_copy, MBB_Player_Name_Map, by = c("Athlete" = "Player Name"))
+
+# Turn athlete column into correct format for categorical data type
+JJ_for_viz$Athlete <- factor(JJ_for_viz$Athlete)
+
+# Filter for Player Rating above 0
+JJ_viz_abv_zero <- JJ_for_viz %>%
+    filter(Player_Rating > 0)
+
+# Create copy of df
+JJ_viz_abv_zero_copy <- JJ_viz_abv_zero
+```
+
+# Exploratory Data Analysis
+
+## Game metrics and +/- EDA
+
+I started by adding the name of the opponent as a column to the dataframe based on the Date of Game column. Once I had the dataframe for player scores with all necessary information included, I began creating initial visualizations to explore what games a specific Athlete performed under their average according to the +/- score and the athletes compared to each other. I was able to gain important insights into which games the team underperformed compared to their average and, for each player, a high level look at what games they played well and which they underperformed. These two combined together gave me a more complete picture of potential games or weeks to explore on a deeper level to explain why the team or individual performed under their standard.
+
+```{r prepare df for plotting}
+# Create a lookup table for dates and opponents
+game_lookup_table <- data.frame(
+  Date_Of_Game = as.Date(c("2022-12-01", "2022-12-04", "2022-12-17", "2022-12-21", "2022-12-29", "2022-12-31", "2023-01-05", "2023-01-07", "2023-01-12", "2023-01-14", "2023-01-19", "2023-01-21", "2023-01-26", "2023-01-28", "2023-02-02", "2023-02-05", "2023-02-11", "2023-02-16", "2023-02-18")), # Add more dates as needed
+  Opponent = c("University of Arizona Game 1", "Washington State Game 1", "BYU", "TCU", "University of California Game 1", "Stanford Game 1", "Oregon State Game 1", "University of Oregon Game 1", "UCLA Game 1", "USC Game 1", "Washington State Game 2", "University of Washington Game 1", "Oregon State Game 2", "University of Oregon Game 2", "Stanford Game 2", "University of California Game 2", "University of Colorado Game 1", "University of Arizona Game 2", "Arizona State Game 1") # Add corresponding opponents
+)
+
+# Merge the game lookup table with the original data frame based on Date_Of_Game
+JJ_plus_minus <- merge(JJ_for_viz, game_lookup_table, by = "Date_Of_Game", all.x = TRUE)
+
+# Merge player ids on player name
+#JJ_plus_minus <- JJ_plus_minus %>%
+#  left_join(MBB_Player_Name_Map, by = c("Athlete" = "Player Name"))
+```
+
+The two visualizations below show which games the selected player had a plus/minus that was above or below their season average. The scatterplot is colored based on how the player's score for the game compared to their season average with dates being the data point labels in the first graph and opponent names being the labels in the second graph.
+
+```{r player plus minus visualization 1}
+# Select player id to make visualization for
+athlete_of_interest = "Player 3"
+
+# Filter the dataframe for selected player
+player_JJ_season_scores <- JJ_plus_minus %>%
+    filter(`Player ID` == athlete_of_interest)
+
+# Calculate the mean Player_Rating
+athlete_season_mean <- mean(player_JJ_season_scores$Player_Rating)
+
+# Create a new column to indicate whether Player_Rating is above or below the mean
+player_JJ_season_scores$Rating_Above_Mean <- ifelse(player_JJ_season_scores$Player_Rating > athlete_season_mean, "Above Mean", "Below Mean")
+
+# Create the base plot without the dates
+player_game_scores <- ggplot(player_JJ_season_scores, 
+                             aes(x = Date_Of_Game, y = Player_Rating, color = Rating_Above_Mean)) +
+  geom_point(size = 8) +
+  scale_color_manual(values = c("Below Mean" = "red", "Above Mean" = "green")) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.background = element_blank()) +
+  labs(x = "Date of Game", y = "JJ Plus Minus Score", color = "Comparison to Mean", title = "What Games did the Player play above their average according to JJ Plus Minus?")
+
+# Create the plot with the dates and add the horizontal average line
+JJ_scores_player_w_line <- player_game_scores +
+  geom_hline(aes(yintercept = mean(Player_Rating)), color = "black") +
+  scale_x_datetime(labels = date_format("%Y-%m-%d"), # Format the dates as "YYYY-MM-DD"
+                   date_breaks = "1 week") + # Set the breaks on the x-axis
+  geom_text(aes(label = format(Date_Of_Game, "%Y-%m-%d")), hjust = -0.2, size = 3) # Add date labels
+
+# Display the plot
+print(JJ_scores_player_w_line)
+```
+
+```{r player plus minus visualization 2}
+# Create the base plot
+player_game_scores <- ggplot(player_JJ_season_scores, 
+                             aes(x = Date_Of_Game, y = Player_Rating, color = Rating_Above_Mean)) +
+  geom_point(size = 6) +
+  scale_color_manual(values = c("Below Mean" = "red", "Above Mean" = "green")) +
+  theme(axis.line = element_line(colour = "black"),
+        panel.background = element_blank()) +
+  labs(x = "Date of Game", y = "JJ Plus Minus Score", color = "Comparison to Mean", title = "What Games did the Player play above their average according to JJ Plus Minus?")
+
+# Create the plot with the opponent names and add the season average as a horizontal line
+JJ_scores_player_w_line <- player_game_scores +
+  geom_hline(aes(yintercept = mean(Player_Rating)), color = "black") +
+  geom_text_repel(aes(label = Opponent), hjust = -0.2, size = 4, box.padding = 0.5)# + # Use geom_text_repel instead of geom_text
+  #scale_x_continuous(labels = scales::comma_format(scale = 1)) # Adjust the x-axis as needed
+
+# Display the plot
+print(JJ_scores_player_w_line)
+```
+
+The below visualization creates a boxplot of player plus/minus distributions over the season, allowing for comparison of how often each player's plus/minus value was above the team average of the season.
+
+```{r player plus minus visualization 3}
+# Create boxplot of all player's plus/minus score
+JJ_scores_dist <- ggplot(JJ_plus_minus, # Set dataset
+              aes(x = `Player ID`, y = Player_Rating, color = `Player ID`)) + # Set aesthetics
+  geom_boxplot(fill = "white") + # Set boxplot
+  theme(axis.line = element_line(colour = "black"), # Set axis line as black
+         #axis.text.x = element_text(angle = 90), # Rotate x-axis labels
+        panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+labs(x = "Athletes", y = "Plus-Minus", # Set labels
+     title = "Season distribution of Plus-Minus by Athlete with Player Average Line") +
+  guides(color = "none") # Turn off color legend
+
+# Add average plus/minus for team across the season
+JJ_scores_dist_bp_w_line <- JJ_scores_dist +
+  geom_hline(aes(yintercept = mean(Player_Rating)), color = "black")
+
+# Display the plot
+JJ_scores_dist_bp_w_line
+```
+
+## Strive data EDA
+
+```{r strive data manipulation}
+# Filter out lifts from strive data
+strive_muscle_no_lift <- strive_season_muscle_data %>% filter(Type != "lifting")
+strive_accelerometer_no_lift <- strive_season_accelerometer_data %>% filter(Type != "lifting")
+
+# Create variable to calculate percentage of accelerations that were classified as 'high' for each session
+strive_accelerometer_no_lift <- strive_accelerometer_no_lift %>%
+    mutate("Perc_High_Accelerations" = round((`High_Accelerations_(>=350_cm/s²)_(Event)` / `Accelerations_(Event)`) * 100))
+
+# Create df to hold team averages of metrics for each session
+team_averages <- strive_accelerometer_no_lift %>%
+  group_by(`Date_(Local)`) %>%
+  summarise(
+    Avg_Team_External_Load = round(mean(External_Load, na.rm = TRUE)),
+    Avg_Number_Accelerations = round(mean(`Accelerations_(Event)`, na.rm = TRUE)),
+    Avg_Number_Decelerations = round(mean(`Decelerations_(Event)`, na.rm = TRUE)),
+    Month = substr(first(`Date_(Local)`), 6, 7),
+    .groups = 'drop' # Ensure the data is ungrouped after summarizing
+  )
+
+# Create bins for Perc_High_Accelerations variable
+external_load_bin_breaks <- seq(350, 600, by = 50)  # Define the bin breaks
+external_load_bin_labels <- c("350-400", "400-450", "450-500", "500-550", "550-600")  # Labels for each bin
+
+# Create a new column with the binned values
+team_averages$Avg_External_Load_Bin <- cut(team_averages$Avg_Team_External_Load, 
+                                                               breaks = external_load_bin_breaks, 
+                                                               labels = external_load_bin_labels,
+                                                               include.lowest = TRUE)
+```
+
+We initially wanted to investigate whether sessions with a high external load were accompanied by a large volume of accelerations and decelerations. I created the below visualization which plots the average number of accelerations and decelerations across the team for each session and set the shape type using the external load bins created above. Additionally, the color parameter was set to show the month of the session to explore if certain months had particularly intense practices compared to others.
+
+```{r strive eda plot 1}
+# Create visualization of average team accelerations and decelerations for each session
+team_averages_1 <- ggplot(team_averages, aes(x = Avg_Number_Decelerations, y = Avg_Number_Accelerations, color = as.factor(Month))) + 
+    geom_point(aes(shape = as.factor(Avg_External_Load_Bin)), size = 8) +
+    theme(plot.title = element_text(size = 22),
+        axis.title.y = element_text(size = 16),
+        axis.title.x = element_text(size = 16),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14)) +
+    labs(x = "Average Number of Decelerations", y = "Average Number of Accelerations", title = "Team Average Number of Acclerations and Decelerations by Strive Event", color = "Month", shape = "Average Team External Load") +
+  scale_color_manual(values = c("#3ABFC0", "#708E99", "#CC0000", "#FFB81D", "#890000", "#E2E6E6"), labels = c("January", "February", "March", "October", "November", "December")) +
+    #scale_shape_manual(values = c("1", "2", "3", "4", "5", "6")) +  # Set shape values as needed
+    dark_theme_bw()
+
+# Plot average lines for accelerations and decelerations
+team_averages_1_w_line <- team_averages_1 +
+    geom_hline(aes(yintercept = mean(Avg_Number_Accelerations)), color = "seagreen1") +
+    geom_vline(aes(xintercept = mean(Avg_Number_Decelerations)), color = "seagreen1")
+
+# Display visualization
+team_averages_1_w_line
+```
+
+We also grouped external load in increments of 100 to generate the visualization below
+
+```{r strive eda plot 1}
+# Filter external load outliers
+strive_filtered <- strive_accelerometer_no_lift %>%
+    filter(External_Load >= "200" & External_Load <= "800")
+
+load_bin_breaks <- seq(200, 800, by = 100)  # Define the bin breaks
+load_bin_labels <- c("200-300", "300-400", "400-500", "500-600", "600-700", "700-800")  # Labels for each bin
+
+# Create a new column with the binned values
+strive_filtered$External_Load_Bin <- cut(strive_filtered$External_Load, 
+                                                               breaks = load_bin_breaks, 
+                                                               labels = load_bin_labels,
+                                                               include.lowest = TRUE)
+
+# Remove sessions that don't fall into bins and rows with very improbable number of high decelerations
+strive_filtered <- strive_filtered %>% filter(External_Load_Bin != "NA",
+                                              `High_Decelerations_(>=350_cm/s²)_(Event)` <= 600)
+
+# Calculate total counts of games and practices
+total_counts <- strive_filtered %>%
+  group_by(Type) %>%
+  summarise(total = n())
+
+# Calculate the percentage within each External_Load_Bin
+proportions <- strive_filtered %>%
+  group_by(External_Load_Bin, Type) %>%
+  summarise(count = n()) %>%
+  left_join(total_counts, by = "Type") %>%
+  mutate(prop = count / total)
+
+# Merge proportions back with the original data
+strive_with_props <- strive_filtered %>%
+  left_join(proportions, by = c("External_Load_Bin", "Type"))
+
+# Plot number of high accelerations and decelerations by type of event (practice/game)
+accelerometer_v2 <- ggplot(strive_filtered, aes(x = `High_Accelerations_(>=350_cm/s²)_(Event)`, y = `High_Decelerations_(>=350_cm/s²)_(Event)`, color = Type)) +
+  geom_point(size = 3, alpha = 0.5) +
+  labs(x = "Number of High Accelerations",
+       y = "Number of High Decelerations",
+       color = "Type of Event",
+       title = "54% of practices have an External Load between 400-500, Games are fairly evenly distributed between External Load Bins",
+       subtitle = "Plots include Accelerations and Decelerations Classified as 'High' by Strive") +
+  scale_color_manual(values = c(practice = "#CC0000", game = "#3ABFC0")) +
+  dark_theme_bw()
+
+# Facet wrap by the External_Load_Bin and add text annotations
+accelerometer_eda2 <- accelerometer_v2 + 
+  facet_wrap(vars(External_Load_Bin), ncol = 3) +
+  geom_text(data = strive_with_props,
+            aes(x = Inf, y = -Inf, label = scales::percent(prop, accuracy = 0.1),
+            hjust = ifelse(Type == "practice", 1.9, 1.9),
+                vjust = ifelse(Type == "game", -10.5, -11.9),
+                color = Type),
+            show.legend = FALSE, inherit.aes = FALSE) +
+  labs(color = "Type Of Event")
+
+accelerometer_eda2
+```
+
+## Force Plate EDA
+
+The first step of the EDA process for the force plate data was to create a new dataframe that filtered the data to the expected roster for the next season in order to personalize the results of the analysis to the returning players.
+
+```{r filter force plate data for different groups}
+# Create a vector of past player ids
+previous_players_id <- c("Player 1", "Player 4", "Player 6", "Player 8", "Player 9", "Player 11", "Player 14")
+
+# Filter analysis for current players only 
+current_players_only <- fp_mbb_w_ids %>%
+    filter(!`Player ID` %in% previous_players_id)
+
+# Find maximum of metrics for all current athletes by test date
+current_players_all_maxs <- current_players_only %>%
+    select(-Trial) %>%
+    group_by(`Player ID`, Test_Date) %>%
+    summarize_all(max)
+
+# Find maximum of metrics for each athlete by test date
+all_players_all_maxs <- overall_force_plate %>%
+    select(-Trial) %>%
+    group_by(`Player ID`, Test_Date) %>%
+    summarize_all(max)
+```
+
+The athletes perform 3 countermovement jumps each test day and there can be quite a bit of variability in the effort given throughout the trials. For this reason it was decided that averaging across all three trials may not be sufficient to truly represent the athlete's ability on a given day. Additionally, we thought that we might miss important information if we looked at which trial the peak value occurred for only one metric. We decided to explore this idea further to see how we could determine the truly "best" jump from each testing date on an individualized basis for each athlete. The visualizations below highlight that, while there may not be much variability in peak power and rsi modified values in trials across the whole team, there are differences present across trials at an individual level. This led us believe that pulling the same trial number for each player would not be sufficient in ascertaining the athlete's best ability on a given day.
+
+```{r team peak power boxplot}
+peak_power_bp_by_trial <- ggplot(current_players_only,
+       aes(x= Trial, y = `Peak_Power_/_BM_.W/kg.`, color = Trial)) +
+    geom_boxplot(fill = "black", size = 1.5) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          axis.title = element_text(size = 18),
+          axis.text = element_text(size = 15)) +
+    labs(x = "Trial Number", y = "Peak Power over Body Mass",
+         title = "Distribution of Team Peak Power by Trial Number")  + 
+    scale_color_manual(values = c("#CC0000", "#3ABFC0", "#FFB81D", "#708E99"), labels = c("Trial 1", "Trial 2", "Trial 3", "Trial 4"))  + 
+  dark_theme_bw()
+
+peak_power_bp_by_trial
+```
+
+```{r create boxplot visualization for any given metric}
+# Define a function to create the plot
+plot_boxplot <- function(data, y_axis_metric) {
+  ggplot(data,
+         aes(x = Trial, y = !!sym(y_axis_metric), color = Trial)) +
+    geom_boxplot(fill = "black", size = 1.5) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank(),
+          axis.title = element_text(size = 18),
+          axis.text = element_text(size = 15)) +
+    labs(x = "Trial Number",
+         y = y_axis_metric,
+         title = paste("Distribution of Team", y_axis_metric, "by Trial Number")) +
+    scale_color_manual(values = c("#CC0000", "#3ABFC0", "#FFB81D", "#708E99"),
+                       labels = c("Trial 1", "Trial 2", "Trial 3", "Trial 4")) +
+    dark_theme_bw()
+}
+
+# Find column names containing the word "RSI"
+matching_columns <- grep("rsi", names(current_players_only), ignore.case = TRUE, value = TRUE)
+
+# Print column names that contain word of interest given above
+matching_columns
+
+plot_boxplot(current_players_only, "RSI-modified_.m/s.")
+```
+
+```{r player peak power boxplot by trial}
+# Remove trial 4 due to very limited sample size, only used if one of three trials before was unsuccessful
+first_three_trials <- current_players_only %>%
+    filter(Trial != "Trial 4")
+
+# Plot peak power for each trial by athlete
+peak_power_bp_by_athlete <- ggplot(first_three_trials,
+       aes(x= `Player ID`, y = `Peak_Power_/_BM_.W/kg.`, color = Trial)) +
+    geom_boxplot(fill = "black", size = .75) +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) +
+    labs(x = "Player", y = "Peak Power over Body Mass",
+         title = "Do Players Typically Achieve Peak Power in Different Trials?")  + 
+    scale_color_manual(values = c("#CC0000", "#3ABFC0", "#FFB81D"), labels = c("Trial 1", "Trial 2", "Trial 3")) + 
+  dark_theme_bw()
+
+# Print visualization
+peak_power_bp_by_athlete
+```
+
+## Trial analysis
+
+The purpose of the trial analysis was to establish the best way to represent an athlete's best effort and ability on a given test date. We knew that averaging across a given day or just taking the trial where one metric was at its maximum would not accomplish this so we decided to look at if the variables we were primarily interested in typically fell in the same trial or not.
+
+To determine the variables of interest in the analysis we based the selection on basketball specific research so that we could make a more manageable dataset from the ~200 variables that were available in the initial export. In our Principal Component Analysis of the Force Plate data, we were able to determine that 12 variables covered 92% of the variance in all of the data so we felt confident in our decision to reduce the number of variables to something very close to that number. We paired input from the Sports Scientists with our research to select the variables of interest that we wanted to maximize and others that needed to be minimized to reflect the best value.
+
+```{r define date parameter and variables of interest}
+# Create copy of dataframe
+overall_force_plate <- fp_mbb_w_ids
+
+# Convert the "Test_Date" column to date format
+overall_force_plate$Test_Date <- as.Date(overall_force_plate$Test_Date)
+
+# Define the specific date to filter
+target_date <- as.Date("2022-06-08")
+
+# Filter the rows for dates greater than or equal to the target date for the start of the season
+force_plate_season_filtered <- overall_force_plate[overall_force_plate$Test_Date >= target_date, ]
+
+# View the extracted test dates
+filtered_fp_dates <- unique(force_plate_season_filtered$Test_Date)
+
+# Extract the year from the "Test_Date" column
+force_plate_season_filtered$Year <- substr(force_plate_season_filtered$Test_Date, 1, 4)
+
+# Maximum variables of interest
+variables_of_interest_max <- c("RSI-modified_.m/s.", "CMJ_Stiffness_.N/m.", "Concentric_Mean_Power_/_BM_.W/kg.", "Eccentric_Deceleration_RFD_/_BM_.N/s/kg.", "Eccentric_Peak_Power_/_BM_.W/kg.", "Peak_Power_/_BM_.W/kg.", "Concentric_Impulse-100ms_.N_s.", "Concentric_RPD_-_100ms_.W/s.", "Concentric_RPD_-_50ms_.W/s.", "Concentric_RPD_/_BM_.W/s/kg.", "Concentric_Peak_Force_/_BM_.N/kg.", "Force_at_Zero_Velocity_.N.", "Jump_Height_.Imp-Mom._in_Inches_.in.", "Eccentric_Peak_Force_/_BM_.N/kg.", "Concentric_Peak_Force_/_BM_.N/kg.")
+
+# Minimum variables of interest
+variables_of_interest_min <- c("Contraction_Time_.ms.", "Eccentric_Duration_.ms.")
+```
+
+### Summary tables by athlete
+
+To better understand the distributions of the metrics of interest, I created summary tables for the players where an athlete can be selected by indexing their player id.
+
+```{r summary tables for athletes}
+# List of players
+players <- c("Player 1", "Player 2", "Player 3", "Player 4", "Player 5", "Player 6", "Player 7", "Player 9")
+
+# Initialize an empty list to store the result data frames
+quartiles_list <- list()
+
+# Loop over each player
+for (player in players) {
+  # Filter the data for the current player
+  selected_athlete <- force_plate_season_filtered %>%
+    filter(`Player ID` == player) %>%
+    select(all_of(c(variables_of_interest_max, variables_of_interest_min)))
+  
+  # Calculate quantiles, mean, and median across all numeric variables
+  quantiles <- sapply(selected_athlete, quantile, probs = c(0.10, 0.25, 0.75, 0.9), na.rm = TRUE)
+  mean_values <- sapply(selected_athlete, mean, na.rm = TRUE)
+  median_values <- sapply(selected_athlete, median, na.rm = TRUE)
+  
+  # Create the result data frame
+  result_df <- data.frame(Bottom_10_Perc = quantiles[1,],
+                          Quantile_25 = quantiles[2,],
+                          Median = median_values,
+                          Mean = mean_values,
+                          Quantile_75 = quantiles[3,],
+                          Top_10_Perc = quantiles[4,])
+  
+  # Add the result data frame to the list
+  quartiles_list[[player]] <- result_df
+}
+
+# View the result data frames for all players
+names(quartiles_list) <- players  # Assign player ids as list names
+
+# Select athlete
+selected_athlete <- quartiles_list["Player 5"]
+
+# Show summary table
+selected_athlete
+```
+
+We first decided to see how the best values for all variables of interest were distributed between each trial number for the entire season. While some athletes seemed to clearly have one trial where they tended to do their best (meaning the largest number of variables maxed out), we wanted to look at this more thoroughly by test date and for the couple of metrics we determined to be the most important for the analysis on an individual basis.
+
+```{r initial trial analysis}
+# List of test dates for the athlete
+test_dates <- c("2022-11-01", "2022-11-10", "2022-11-15", "2022-11-16", "2022-11-29", "2022-11-30", "2022-12-06", "2022-12-12", "2022-12-16", "2022-12-19", "2023-01-04", "2023-01-09", "2023-01-11", "2023-01-17", "2023-01-18", "2023-01-24", "2023-01-25", "2023-01-31", "2023-02-01", "2023-02-04", "2023-02-07", "2023-02-10", "2023-02-13", "2023-02-15", "2023-02-20", "2023-03-02", "2023-02-21", "2023-02-22", "2023-02-28", "2023-03-03", "2023-03-06")
+
+athlete_to_analyze = "Player 5"
+
+# Function to calculate counts for one test date
+get_counts_for_test_date <- function(test_date) {
+  one_fp_date <- force_plate_season_filtered %>%
+    filter(`Player ID` == athlete_to_analyze,
+           Test_Date == test_date) %>%
+    select(all_of(c(variables_of_interest_max, variables_of_interest_min)))
+  
+  # Find row index of max value for each column in variables_of_interest_max
+  max_rows <- sapply(one_fp_date[, variables_of_interest_max], which.max)
+  
+  # Find row index of min value for each column in variables_of_interest_min
+  min_rows <- sapply(one_fp_date[, variables_of_interest_min], which.min)
+  
+  # Combine the row indices of max and min values
+  all_rows <- c(max_rows, min_rows)
+  
+  # Count occurrences of values 1, 2, and 3
+  value_counts <- table(unlist(all_rows))
+  
+  return(value_counts)
+}
+
+
+# Calculate counts for each test date using lapply
+counts_list <- lapply(test_dates, get_counts_for_test_date)
+
+# Function to convert a table to a full table with all values from 1 to 3
+convert_to_full_table <- function(tbl) {
+  full_tbl <- table(factor(names(tbl), levels = c("1", "2", "3")))
+  full_tbl[names(tbl)] <- tbl
+  return(full_tbl)
+}
+
+# Convert each table in the list to full tables
+full_counts_list <- lapply(counts_list, convert_to_full_table)
+
+# Function to aggregate counts across the full tables
+aggregate_counts <- function(count1, count2) {
+  result <- count1 + count2
+  return(result)
+}
+
+# Use Reduce to aggregate the counts
+final_counts <- Reduce(aggregate_counts, full_counts_list)
+
+# Print the final counts
+print(final_counts)
+```
+
+Next we determined that Peak Power/Body Mass and RSI modified were the most important variables to our analysis so we decided to compare the trials where the max Peak Power/BM fell against trials where the RSI Modified max fell. To accomplish this, I first filtered the dataset for only the most important variables and created functions that pulled the trial where the max occurred for RSI and PP/BM into 'final_df' which has multiple rows for test dates where these maxes fell in different trials and only one row if the maxes happened in the same trial.
+
+```{r determine trials where max of important variables occurred}
+important_vars <- c("Test_Date", "RSI-modified_.m/s.", "Peak_Power_/_BM_.W/kg.")
+
+athlete_to_analyze = "Player 5"
+
+# List to store the results
+results_list <- list()
+
+# Loop over each test date
+for (test_date in test_dates) {
+  # Filter the data for the specific test date and select the important variables
+  one_fp_date <- force_plate_season_filtered %>%
+    filter(`Player ID` == athlete_to_analyze, Test_Date == test_date) %>%
+    select(all_of(important_vars))
+  
+  # Store the result in the results list
+  results_list[[test_date]] <- one_fp_date
+}
+
+# Combine the list of data frames into one data frame
+combined_df <- bind_rows(results_list, .id = "Test_Date")
+
+# Function to get rows with maximum values for each column
+get_rows_with_max_values <- function(one_fp_date) {
+  max_rows <- apply(one_fp_date[, -1], 2, function(col) which(col == max(col)))
+  max_rows <- unique(unlist(max_rows))
+  return(one_fp_date[max_rows, , drop = FALSE])
+}
+
+# Calculate rows with maximum values for each test date using lapply
+rows_with_max_values_list <- lapply(unique(combined_df$Test_Date), function(test_date) {
+  one_fp_date <- combined_df[combined_df$Test_Date == test_date, ]
+  get_rows_with_max_values(one_fp_date)
+})
+
+# Combine the list of data frames into one data frame
+final_df <- do.call(rbind, rows_with_max_values_list)
+
+# View the resulting data frame
+print(final_df)
+```
+
+From final_df, I was able to filter on a column that denoted which test dates had differing trials where the max of PP/BM and RSI Modified fell and calculate the difference in each of these metrics across the two trials. I then compared the differences in these metrics to the mean and standard deviation of all of the jump tests in the season for the selected athlete to determine if pulling only one trial based on Peak Power/BM would be sufficient to represent the best jump of the day for each athlete. Through this analysis I was able to determine that for each athlete the vast majority of test dates had the best PP/BM and RSI Modified values occur in the same trial or the difference between the two trials was within one standard deviation of the mean for each metric. Ultimately, less than 10% of test dates for all players had ambiguity about which trial may represent the athlete's best jump of the day when looking specifically at the Peak Power/Body Mass and RSI Modified metrics so we felt confident proceeding by taking the trial where the athlete achieved their highest PP/BM value for each test date.
+
+```{r trial analysis conclusion}
+# Make a copy of final_df
+player_max_trials <- final_df
+
+# Create column to denote the test dates where max of variables fell in multiple trials
+player_max_trials$Unique_Test_Date <- ifelse(duplicated(player_max_trials$Test_Date) | duplicated(player_max_trials$Test_Date, fromLast = TRUE), 0, 1)
+
+# Filter df to only test dates that had multiple trials
+mult_max_trials <- player_max_trials %>%
+    filter(Unique_Test_Date == 0)
+
+# Calculate the differences for each test date
+avg_differences <- mult_max_trials %>%
+  group_by(Test_Date) %>%
+  mutate(
+    Diff_Peak_Power = max(`Peak_Power_/_BM_.W/kg.`) - min(`Peak_Power_/_BM_.W/kg.`),
+    Diff_RSI = max(`RSI-modified_.m/s.`) - min(`RSI-modified_.m/s.`)) %>%
+  ungroup()
+
+# View the resulting data frame
+print(avg_differences)
+
+# Look at average difference between PP/BM and RSI Modified between two trials
+test_date_diff <- avg_differences %>%
+  group_by(Test_Date) %>%
+  summarize(Diff_Peak_Power = mean(Diff_Peak_Power),
+            Diff_RSI = mean(Diff_RSI))
+
+# Print resulting df
+print(test_date_diff)
+
+# Generate summary statistics of differences in these metrics across all test dates
+summary(test_date_diff)
+
+# Find average and standard deviation of RSI and PP/BM for all trials of the athlete to contextualize magnitude of difference in metrics between trials
+force_plate_season_filtered %>%
+    filter(`Player ID` == athlete_to_analyze) %>%
+    summarize(mean_RSI = mean(`RSI-modified_.m/s.`),
+              std_dev_RSI = sd(`RSI-modified_.m/s.`),
+              mean_PP_BM = mean(`Peak_Power_/_BM_.W/kg.`),
+              std_dev_BM = sd(`Peak_Power_/_BM_.W/kg.`))
+```
+
+### Merging of data sources
+
+Add indicator for if a force plate testing date was in season or in pre season / summer
+```{r set up force plate df for merging}
+# Define all possible test dates
+all_test_dates <- c("2022-11-01", "2022-11-10", "2022-11-15", "2022-11-16", "2022-11-29", "2022-11-30", "2022-12-06", "2022-12-12", "2022-12-16", "2022-12-19", "2023-01-04", "2023-01-09", "2023-01-11", "2023-01-17", "2023-01-18", "2023-01-24", "2023-01-25", "2023-01-31", "2023-02-01", "2023-02-04", "2023-02-07", "2023-02-10", "2023-02-13", "2023-02-15", "2023-02-20", "2023-02-21", "2023-02-22", "2023-02-28", "2023-03-02", "2023-03-03", "2023-03-06")
+
+# Create column to separate in-season tests from preseason and summer
+force_plate_season_filtered$In_Season <- ifelse(force_plate_season_filtered$Test_Date %in% all_test_dates, 1, 0)
+
+# Convert column to integer type
+force_plate_season_filtered$In_Season <- as.integer(force_plate_season_filtered$In_Season)
+
+# Add Opponent column to map force plate testing sessions to closest game
+force_plate_season_filtered$Opponent <- ifelse(force_plate_season_filtered$Test_Date == "2022-11-01", "Westminster", ifelse(force_plate_season_filtered$Test_Date == "2022-11-10", "CSU Bakersfield", ifelse(force_plate_season_filtered$Test_Date == "2022-11-15", "Idaho State", ifelse(force_plate_season_filtered$Test_Date == "2022-11-16", "Sam Houston State", ifelse(force_plate_season_filtered$Test_Date == "2022-11-29", "St. Thomas", ifelse(force_plate_season_filtered$Test_Date == "2022-11-30", "University of Arizona Game 1", ifelse(force_plate_season_filtered$Test_Date == "2022-12-06", "Washington State Game 1", ifelse(force_plate_season_filtered$Test_Date == "2022-12-12", "UTSA", ifelse(force_plate_season_filtered$Test_Date == "2022-12-16", "BYU", ifelse(force_plate_season_filtered$Test_Date == "2022-12-19", "TCU", ifelse(force_plate_season_filtered$Test_Date == "2023-01-04", "Oregon State Game 1", ifelse(force_plate_season_filtered$Test_Date == "2023-01-09", "University of Oregon Game 1", ifelse(force_plate_season_filtered$Test_Date == "2023-01-11", "UCLA Game 1", ifelse(force_plate_season_filtered$Test_Date == "2023-01-17", "USC Game 1", ifelse(force_plate_season_filtered$Test_Date == "2023-01-18", "Washington State Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-01-24", "University of Washington Game 1", ifelse(force_plate_season_filtered$Test_Date == "2023-01-25", "Oregon State Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-01-31", "University of Oregon Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-02-01", "Stanford Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-02-04", "University of California Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-02-07", "University of California Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-02-10", "University of Colorado Game 1", ifelse(force_plate_season_filtered$Test_Date == "2023-02-13", "University of Colorado Game 1", ifelse(force_plate_season_filtered$Test_Date == "2023-02-15", "University of Arizona Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-02-20", "Arizona State Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-02-22", "UCLA Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-02-28", "USC Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-03-03", "University of Colorado Game 2", ifelse(force_plate_season_filtered$Test_Date == "2023-03-06", "Stanford PAC12 Game", NA)))))))))))))))))))))))))))))
+```
+
+```{r}
+fp_with_game_info <- merge(force_plate_season_filtered, clean_MBB_game_info, by = "Opponent", all.x = TRUE)
+```
+
+### EDA of merged datasets
+
+```{r subsetting data}
+# Filter for only tests that can be mapped to within 3 days before or after a game
+before_after_comp <- fp_with_game_info %>%
+    filter(!is.na(`Test_Before?`) & !is.na(`Test_After?`))
+
+# Create dfs only with tests before and tests after
+tests_before <- before_after_comp %>%
+    filter(`Test_Before?` == "1")
+tests_after <- before_after_comp %>%
+    filter(`Test_After?` == "1")
+
+# Create dfs based on how many days after game the testing session was
+tests_1d_after <- tests_after %>%
+    filter(Test_Num_Days_After_Game == "1")
+tests_d2_after <- tests_after %>%
+    filter(Test_Num_Days_After_Game == "2")
+tests_d3_after <- tests_after %>%
+    filter(Test_Num_Days_After_Game == "3")
+```
+
+```{r rsi modified histogram by athlete for tests before vs tests after}
+# Histogram by athlete of rsi modified values for tests before vs tests after a game
+rsi_mod_hist <- ggplot(before_after_comp, aes(x = `RSI-modified_.m/s.`, fill = as.factor(`Test_Before?`))) +
+  geom_histogram(alpha = 0.5, bins = 20) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 10)) +
+  labs(title = "Do any Individual Player's RSI Modified Values differ significantly before and after Games?", x = "RSI Modified", fill = "When was FP test?")  + 
+    scale_fill_manual(values = c("#CC0000", "#3ABFC0"), labels = c("After Game", "Before Game")) +
+    facet_wrap(~ as.factor(`Player ID`), nrow = 4)
+
+# Show visualization
+rsi_mod_hist
+```
+
+```{r rsi modified density plot by athlete}
+# Density plot by athlete of rsi modified values for tests before vs tests after a game
+rsi_mod_games <- ggplot(before_after_comp, aes(x = `RSI-modified_.m/s.`, fill = as.factor(`Test_Before?`))) +
+  geom_density(alpha = 0.5) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 10)) +
+  labs(title = "Do any individual player's RSI Modified Values differ differ significantly before and after Games?", x = "RSI Modified", fill = "When was FP test?") +
+    scale_fill_manual(values = c("#CC0000", "#3ABFC0"), labels = c("After Game", "Before Game")) +
+    facet_wrap(~ as.factor(`Player ID`), nrow = 4)
+
+# Show visualization
+rsi_mod_games
+```
+
+```{r rsi modified visualization for testing sessions after games}
+# Density plot of rsi modified values to compare distributions of tests done 1, 2, and 3 days after game
+rsi_mod_dens3 <- ggplot(tests_after, aes(x = `RSI-modified_.m/s.`, fill = as.factor(`Test_Num_Days_After_Game`))) +
+  geom_density(alpha = 0.5) +
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +  # Remove grid 
+ labs(title = "Does RSI Mod Differ Significantly in number of days after game?", x = "RSI Modified", fill = "Number of days after game") + 
+    scale_fill_manual(values = c("#CC0000", "#FFB81D", "#3ABFC0"), labels = c("1 day", "2 days", "3 days"))
+
+# Show visualization
+rsi_mod_dens3
+```
+
+```{r overall peak power over body mass density plot}
+# Density plot of PP/BM for the team based on whether test was before or after a game
+peak_power_dist_1 <- ggplot(before_after_comp, aes(x = `Peak_Power_/_BM_.W/kg.`, fill = as.factor(`Test_Before?`))) +
+  geom_density(alpha = 0.5) +
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) +  # Remove grid
+ labs(title = "Does Peak Power Differ Significantly whether team tested Before or After the Game?", x = "Peak Power over Body Mass", fill = "When was FP test?") + 
+    scale_fill_manual(values = c("#CC0000", "#3ABFC0"), labels = c("After Game", "Before Game"))
+
+# Show visualization
+peak_power_dist_1
+```
+
+```{r peak power over body mass density plot by athlete}
+# Density plot by athlete of PP/BM values for tests before vs tests after a game
+pp_bm_comparison <- ggplot(before_after_comp, aes(x = `Peak_Power_/_BM_.W/kg.`, fill = as.factor(`Test_Before?`))) +
+  geom_density(alpha = 0.5) +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank(),
+        plot.title = element_text(size = 10)) +
+  labs(title = "Do any individual player's Peak Power over Body Mass differ significantly before and after Games?", x = "Peak Power over Body Mass", fill = "When was FP test?") +
+    scale_fill_manual(values = c("#CC0000", "#3ABFC0"), labels = c("After Game", "Before Game")) +
+    facet_wrap(~ as.factor(`Player ID`), nrow = 4)
+
+# Show visualization
+pp_bm_comparison
+```
+
+# Analysis
+
+## Significance tests
+
+We performed t-tests to see which variables differed significantly between Force Plate testing sessions before and after games, focusing on the variables of interest. 
+
+```{r}
+# Perform a t-test
+result2 <- t.test(tests_d2_after$`RSI-modified_.m/s.`, tests_d3_after$`RSI-modified_.m/s.`)
+
+result2
+```
+
+## Regression modeling
+
+We used linear regression modeling to determine which metrics from the Force Plate data had the strongest relationship with each position group (Bigs, Guards, Wings). We wanted to see if we could differentiate what metrics may be the most important indicators of fatigue and personalize the results to each position group. I mostly contributed to getting the data ready for modeling and my group members completed the linear modeling phase of the project.
+
+
