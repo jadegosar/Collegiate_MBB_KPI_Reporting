@@ -66,5 +66,5 @@ The picture below shows the dashboard page that I created in PowerBI as a potent
 
 My group member Ethan created the final dashboard in PowerBI that would be used by the Strength and Conditioning staff to inform their decision-making on whether an athlete may be fatigued or if there is any intervention needed based on how the athlete is testing across the important metrics collected via Force Plates. His awesome work is picured below!
 
-<center><img src="MBB_Dash_1.png"/></center>
-<center><img src="MBB_Dash_2.png"/></center>
+<center><img src="images/MBB_Dash_1.png"/></center>
+<center><img src="images/MBB_Dash_2.png"/></center>
