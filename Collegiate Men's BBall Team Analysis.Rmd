@@ -43,7 +43,7 @@ Load in performance data from Force Plate countermovement jumps, team's schedule
 
 ```{r import and clean Force Plate data}
 # Load in Force Plate CMJ data
-MBB_CMJ_All_Trials <- read_excel("MBB CMJ All Trials.xlsx")
+MBB_CMJ_All_Trials <- read_excel("cmj_example.xlsx")
 
 all_force_plate <- MBB_CMJ_All_Trials
 
@@ -85,9 +85,9 @@ fp_mbb_w_ids$Test_Date <- format(fp_mbb_w_ids$Test_Date, "%Y/%m/%d")
 
 ```{r import and clean schedule info}
 # Load in MBB Schedule info
-MBB_game_info_22_23 <- read_excel("Men's BBall Schedule info.xlsx", 
+MBB_game_info_22_23 <- read_excel("schedule_example.xlsx", 
     sheet = "22-23")
-MBB_game_info_21_22 <- read_excel("Men's BBall Schedule info.xlsx", 
+MBB_game_info_21_22 <- read_excel("schedule_example.xlsx", 
     sheet = "21-22")
 
 # Combine 21-22 and 22-23 seasons into one df
@@ -184,7 +184,7 @@ strive_season_muscle_data <- strive_season_muscle_data %>%
 ```
 
 ```{r import minutes played file}
-min_played <- read_excel("Men's Basketball - MIN Played Export (1).xlsx", 
+min_played <- read_excel("min_played.xlsx", 
     sheet = "Min Played")
 
 # Define new column names for pivoted minutes played file
@@ -211,10 +211,10 @@ colnames(min_played_long_clean)[colnames(min_played_long_clean) == "Date"] <- "D
 colnames(min_played_long_clean)[colnames(min_played_long_clean) == "Value"] <- "Minutes_Played"
 
 # Update names for athletes with inconsistent name across data sources and remove outliers
-min_played_long_clean$Athlete <- ifelse(min_played_long_clean$Athlete == "Wilguens Junior Exacte",
-                                            "Wil Exacte",
-                                            ifelse(min_played_long_clean$Athlete == "Mike Saunders ",
-                                                   "Mike Saunders", min_played_long_clean$Athlete))
+min_played_long_clean$Athlete <- ifelse(min_played_long_clean$Athlete == "Example Player Name",
+                                            "Cleaned Player Name",
+                                            ifelse(min_played_long_clean$Athlete == "Example Player Name ",
+                                                   "Cleaned Player Name", min_played_long_clean$Athlete))
 
 # Merge df with player name map to de-identify outputs
 min_played_long_formatted <- left_join(min_played_long_clean, MBB_Player_Name_Map, by = c("Athlete" = "Player Name")) %>%
@@ -232,10 +232,10 @@ JJ_Ratings <- read_excel("Ratings.xlsx", sheet = "Sheet1")
 colnames(JJ_Ratings)[colnames(JJ_Ratings) == "Overall_Rating"] <- "Player_Rating"
 
 # Update names for athletes with inconsistent name across data sources
-JJ_Ratings$Athlete <- ifelse(JJ_Ratings$Athlete == "Wilguens Exacte",
-                                            "Wil Exacte",
-                                            ifelse(JJ_Ratings$Athlete == "Mike Saunders Jr.",
-                                                   "Mike Saunders", JJ_Ratings$Athlete))
+JJ_Ratings$Athlete <- ifelse(JJ_Ratings$Athlete == "Example Player Name",
+                                            "Cleaned Player Name",
+                                            ifelse(JJ_Ratings$Athlete == "Example Player Name",
+                                                   "Cleaned Player Name", JJ_Ratings$Athlete))
 
 # Create copy of data source to keep a copy of the original
 game_metrics_copy <- JJ_Ratings
